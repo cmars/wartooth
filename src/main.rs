@@ -1,5 +1,4 @@
 extern crate futures;
-extern crate futures_cpupool;
 extern crate tokio_core;
 extern crate tokio_proto;
 extern crate tokio_service;
@@ -14,8 +13,7 @@ use tokio_proto::pipeline::ServerProto;
 use tokio_core::io::{Io, Framed};
 use tokio_service::Service;
 use tokio_proto::TcpServer;
-use futures::{future, Async, Future, BoxFuture};
-use futures_cpupool::CpuPool;
+use futures::{future, Future, BoxFuture};
 
 pub struct LineCodec;
 
@@ -67,8 +65,10 @@ impl Codec for LineCodec {
     }
 
     fn encode(&mut self, msg: String, buf: &mut Vec<u8>) -> io::Result<()> {
-        buf.extend_from_slice(msg.as_bytes());
-        buf.push(b'\n');
+        if !msg.is_empty() {
+            buf.extend_from_slice(msg.as_bytes());
+            buf.push(b'\n');
+        }
         Ok(())
     }
 }
@@ -92,15 +92,11 @@ impl<T: Io + 'static> ServerProto<T> for LineProto {
 
 pub struct KV {
     store: Arc<Mutex<HashMap<String, String>>>,
-    thread_pool: CpuPool,
 }
 
 impl KV {
-    fn new() -> KV {
-        KV {
-            store: Arc::new(Mutex::new(HashMap::new())),
-            thread_pool: CpuPool::new(10),
-        }
+    fn new(store: Arc<Mutex<HashMap<String, String>>>) -> KV {
+        KV { store: store }
     }
 }
 
@@ -143,7 +139,9 @@ fn main() {
     // The builder requires a protocol and an address
     let server = TcpServer::new(LineProto, addr);
 
+    let store = Arc::new(Mutex::new(HashMap::new()));
+
     // We provide a way to *instantiate* the service for each new
     // connection; here, we just immediately return a new instance.
-    server.serve(|| Ok(KV::new()));
+    server.serve(move || Ok(KV::new(store.clone())));
 }
