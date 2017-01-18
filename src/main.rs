@@ -7,19 +7,23 @@ use std::io;
 use std::str;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use tokio_core::io::{Codec, EasyBuf};
+use tokio_core::reactor::{Core, Timeout};
+use tokio_core::net::TcpListener;
 use tokio_proto::pipeline::ServerProto;
 use tokio_core::io::{Io, Framed};
 use tokio_service::Service;
 use tokio_proto::TcpServer;
-use futures::{future, Future, BoxFuture};
+use futures::{future, Future, BoxFuture, Stream, Sink};
 
 pub struct LineCodec;
 
 pub enum Command {
     Get(String),
     Set(String, String),
+    Quit,
 }
 
 impl Codec for LineCodec {
@@ -54,6 +58,7 @@ impl Codec for LineCodec {
                         Ok(Some(Command::Set(fields[1].to_string(), fields[2].to_string())))
                     }
                 }
+                "quit" => Ok(Some(Command::Quit)),
                 _ => {
                     Err(io::Error::new(io::ErrorKind::Other,
                                        format!("unknown command: {}", fields[0])))
@@ -127,21 +132,36 @@ impl Service for KV {
                     None => "".to_string(),
                 }
             }
+            Command::Quit => {
+                println!("quit received");
+                return future::err(io::Error::new(io::ErrorKind::Other, "quit")).boxed();
+            }
         };
         future::ok(res).boxed()
     }
 }
 
 fn main() {
-    // Specify the localhost address
-    let addr = "0.0.0.0:12345".parse().unwrap();
-
-    // The builder requires a protocol and an address
-    let server = TcpServer::new(LineProto, addr);
-
     let store = Arc::new(Mutex::new(HashMap::new()));
 
-    // We provide a way to *instantiate* the service for each new
-    // connection; here, we just immediately return a new instance.
-    server.serve(move || Ok(KV::new(store.clone())));
+    let mut core = Core::new().unwrap();
+    let handle = core.handle();
+
+    let addr = "0.0.0.0:12345".parse().unwrap();
+    let listener = TcpListener::bind(&addr, &handle).unwrap();
+    let connections = listener.incoming();
+    let timebomb = Timeout::new(Duration::new(30, 0), &handle).unwrap();
+    let server = connections.for_each(move |(socket, _peer_addr)| {
+            let (wr, rd) = socket.framed(LineCodec).split();
+            let mut service = KV::new(store.clone());
+
+            let responses = rd.and_then(move |req| service.call(req));
+            let server = wr.send_all(responses).then(|_| Ok(()));
+            handle.spawn(server);
+
+            Ok(())
+        })
+        .select(timebomb);
+
+    core.run(server);
 }
