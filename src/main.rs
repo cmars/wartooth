@@ -1,11 +1,13 @@
 extern crate futures;
 extern crate tokio_core;
 extern crate tokio_proto;
+extern crate tokio_process;
 extern crate tokio_service;
 
 use std::io;
 use std::str;
 use std::collections::HashMap;
+use std::process::{Command, ExitStatus};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -16,18 +18,19 @@ use tokio_proto::pipeline::ServerProto;
 use tokio_core::io::{Io, Framed};
 use tokio_service::Service;
 use tokio_proto::TcpServer;
+use tokio_process::CommandExt;
 use futures::{future, Future, BoxFuture, Stream, Sink};
 
 pub struct LineCodec;
 
-pub enum Command {
+pub enum KVCmd {
     Get(String),
     Set(String, String),
     Quit,
 }
 
 impl Codec for LineCodec {
-    type In = Command;
+    type In = KVCmd;
     type Out = String;
 
     fn decode(&mut self, buf: &mut EasyBuf) -> io::Result<Option<Self::In>> {
@@ -48,17 +51,17 @@ impl Codec for LineCodec {
                     if fields.len() < 2 {
                         Err(io::Error::new(io::ErrorKind::Other, "get: missing key"))
                     } else {
-                        Ok(Some(Command::Get(fields[1].to_string())))
+                        Ok(Some(KVCmd::Get(fields[1].to_string())))
                     }
                 }
                 "set" => {
                     if fields.len() < 3 {
                         Err(io::Error::new(io::ErrorKind::Other, "set: missing key and/or value"))
                     } else {
-                        Ok(Some(Command::Set(fields[1].to_string(), fields[2].to_string())))
+                        Ok(Some(KVCmd::Set(fields[1].to_string(), fields[2].to_string())))
                     }
                 }
-                "quit" => Ok(Some(Command::Quit)),
+                "quit" => Ok(Some(KVCmd::Quit)),
                 _ => {
                     Err(io::Error::new(io::ErrorKind::Other,
                                        format!("unknown command: {}", fields[0])))
@@ -82,7 +85,7 @@ pub struct LineProto;
 
 impl<T: Io + 'static> ServerProto<T> for LineProto {
     /// For this protocol style, `Request` matches the codec `In` type
-    type Request = Command;
+    type Request = KVCmd;
 
     /// For this protocol style, `Response` matches the coded `Out` type
     type Response = String;
@@ -107,7 +110,7 @@ impl KV {
 
 impl Service for KV {
     // These types must match the corresponding protocol types:
-    type Request = Command;
+    type Request = KVCmd;
     type Response = String;
 
     // For non-streaming protocols, service errors are always io::Error
@@ -120,19 +123,19 @@ impl Service for KV {
     fn call(&self, req: Self::Request) -> Self::Future {
         let mut store = self.store.lock().unwrap();
         let res = match req {
-            Command::Get(ref k) => {
+            KVCmd::Get(ref k) => {
                 match store.get(k) {
                     Some(v) => v.to_string(),
                     None => "".to_string(),
                 }
             }
-            Command::Set(k, v) => {
+            KVCmd::Set(k, v) => {
                 match store.insert(k, v) {
                     Some(v_old) => v_old.to_string(),
                     None => "".to_string(),
                 }
             }
-            Command::Quit => {
+            KVCmd::Quit => {
                 println!("quit received");
                 return future::err(io::Error::new(io::ErrorKind::Other, "quit")).boxed();
             }
@@ -147,21 +150,30 @@ fn main() {
     let mut core = Core::new().unwrap();
     let handle = core.handle();
 
-    let addr = "0.0.0.0:12345".parse().unwrap();
+    let addr = "127.0.0.1:0".parse().unwrap();
     let listener = TcpListener::bind(&addr, &handle).unwrap();
+    let listen_addr = &listener.local_addr().unwrap();
+    println!("{}", listen_addr);
     let connections = listener.incoming();
-    let timebomb = Timeout::new(Duration::new(30, 0), &handle).unwrap();
+    let child = Command::new("./test.bash")
+        .env("ADDR", format!("{}", listen_addr))
+        .spawn_async(&handle)
+        .expect("failed to spawn")
+        .map(|_: ExitStatus| ());
+    //.let timebomb = Timeout::new(Duration::new(30, 0), &handle).unwrap();
     let server = connections.for_each(move |(socket, _peer_addr)| {
-            let (wr, rd) = socket.framed(LineCodec).split();
-            let mut service = KV::new(store.clone());
+        let (wr, rd) = socket.framed(LineCodec).split();
+        let mut service = KV::new(store.clone());
 
-            let responses = rd.and_then(move |req| service.call(req));
-            let server = wr.send_all(responses).then(|_| Ok(()));
-            handle.spawn(server);
+        let responses = rd.and_then(move |req| service.call(req));
+        let server = wr.send_all(responses).then(|_| Ok(()));
+        handle.spawn(server);
 
-            Ok(())
-        })
-        .select(timebomb);
+        Ok(())
+    });
+    // let comb = server.select(timebomb);
+    // let comb = server.select(child);
+    let comb = child.select(server);
 
-    core.run(server);
+    core.run(comb);
 }
